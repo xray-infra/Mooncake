@@ -55,7 +55,7 @@ jobs:
               build-essential cmake ninja-build git pkg-config python3-dev \
               libibverbs-dev libgoogle-glog-dev libgflags-dev libjsoncpp-dev \
               libunwind-dev libnuma-dev libboost-all-dev libssl-dev libyaml-cpp-dev \
-              libcurl4-openssl-dev liburing-dev libzstd-dev libasio-dev libxxhash-dev
+              libcurl4-openssl-dev liburing-dev libzstd-dev libasio-dev libxxhash-dev libmsgpack-cxx-dev
             cmake --version
             c++ --version
             dpkg-query -W -f='${Package} ${Version}\n'
