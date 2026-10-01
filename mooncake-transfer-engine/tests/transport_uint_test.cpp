@@ -31,6 +31,9 @@
 #include "transfer_engine.h"
 #include "transfer_engine_impl.h"
 #include "transport/transport.h"
+#if defined(USE_EVENT_DRIVEN_COMPLETION) && defined(USE_TCP)
+#include "transport/tcp_transport/tcp_transport.h"
+#endif
 
 using namespace mooncake;
 
@@ -70,6 +73,11 @@ class TransferEngineImplTestPeer {
 
     static void setUseBarex(TransferEngineImpl& engine, bool use_barex) {
         engine.use_barex_ = use_barex;
+    }
+
+    static std::shared_ptr<Transport> transport(TransferEngineImpl& engine,
+                                                const std::string& name) {
+        return engine.multi_transports_->transport_map_.at(name);
     }
 };
 
@@ -717,13 +725,269 @@ TEST_F(TransportTest, GroupedTaskCompletionWaitsForSubmissionSeal) {
     EXPECT_FALSE(task.is_finished);
 
     Transport::Slice::sealTaskSubmission(&task);
-    EXPECT_TRUE(task.is_finished);
+    // Notification publishes event completion; status queries own the flag
+    // used by freeBatchID.
+    EXPECT_FALSE(task.is_finished);
+    EXPECT_TRUE(task.completion_published);
     EXPECT_TRUE(batch.is_finished.load());
     EXPECT_EQ(batch.finished_task_count.load(), 1);
 
     Transport::Slice::sealTaskSubmission(&task);
     EXPECT_EQ(batch.finished_task_count.load(), 1);
 }
+
+#ifdef USE_TCP
+static Transport::TransferTask& AddEventTask(Transport::BatchID batch_id,
+                                             size_t slice_count,
+                                             Transport* transport) {
+    auto& batch = Transport::toBatchDesc(batch_id);
+    auto& task = batch.task_list.emplace_back();
+    task.batch_id = batch_id;
+    task.transport_ = transport;
+    task.slice_count = slice_count;
+    for (size_t i = 0; i < slice_count; ++i) {
+        auto* slice = new Transport::Slice{};
+        slice->task = &task;
+        slice->length = 1;
+        slice->status = Transport::Slice::PENDING;
+        task.slice_list.push_back(slice);
+    }
+    return task;
+}
+
+TEST_F(TransportTest, EventCompletionProducerLocksBeforeCounters) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:17961"), 0);
+    Transport* tcp = engine.installTransport("tcp", nullptr);
+    ASSERT_NE(tcp, nullptr);
+    const auto batch_id = engine.allocateBatchID(2);
+    auto& first = AddEventTask(batch_id, 1, tcp);
+    auto& second = AddEventTask(batch_id, 1, tcp);
+    auto& batch = Transport::toBatchDesc(batch_id);
+    std::unique_lock<std::mutex> lock(batch.completion_mutex);
+    std::promise<void> started;
+    auto ready = started.get_future();
+    auto producer = std::async(std::launch::async, [&] {
+        started.set_value();
+        first.slice_list[0]->markSuccess();
+    });
+    ready.wait();
+    // This is not the last task. The old helper never took the batch mutex
+    // here, and could publish counters/finished before its batch borrowing
+    // ended.
+    EXPECT_EQ(producer.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    EXPECT_EQ(__atomic_load_n(&first.success_slice_count, __ATOMIC_ACQUIRE),
+              0u);
+    lock.unlock();
+    producer.get();
+    second.slice_list[0]->markSuccess();
+    TransferStatus status;
+    EXPECT_TRUE(engine.getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(engine.getTransferStatus(batch_id, 1, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
+}
+
+static void CheckEventFreeJoinsMutex(bool multi_transport) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, multi_transport ? "127.0.0.1:17962"
+                                                        : "127.0.0.1:17963"),
+              0);
+    Transport* tcp = engine.installTransport("tcp", nullptr);
+    ASSERT_NE(tcp, nullptr);
+    const auto batch_id =
+        multi_transport ? engine.allocateBatchID(1) : tcp->allocateBatchID(1);
+    auto& task = AddEventTask(batch_id, 1, tcp);
+    auto& batch = Transport::toBatchDesc(batch_id);
+    std::unique_lock<std::mutex> lock(batch.completion_mutex);
+    std::promise<void> started;
+    auto ready = started.get_future();
+    auto releaser = std::async(std::launch::async, [&] {
+        started.set_value();
+        return multi_transport ? engine.freeBatchID(batch_id)
+                               : tcp->freeBatchID(batch_id);
+    });
+    ready.wait();
+    // A pending task keeps the old baseline alive even when it fails this
+    // assertion: no test deliberately deletes a locked/live BatchDesc.
+    EXPECT_EQ(releaser.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    lock.unlock();
+    EXPECT_TRUE(releaser.get().IsBatchBusy());
+    task.slice_list[0]->markSuccess();
+    TransferStatus status;
+    EXPECT_TRUE(tcp->getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE((multi_transport ? engine.freeBatchID(batch_id)
+                                 : tcp->freeBatchID(batch_id))
+                    .ok());
+}
+
+TEST_F(TransportTest, EventCompletionMultiFreeJoinsMutex) {
+    CheckEventFreeJoinsMutex(true);
+}
+
+TEST_F(TransportTest, EventCompletionBaseFreeJoinsMutex) {
+    CheckEventFreeJoinsMutex(false);
+}
+
+TEST_F(TransportTest, EventCompletionCvRequiresRealBatchQueryBeforeFree) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:17964"), 0);
+    Transport* tcp = engine.installTransport("tcp", nullptr);
+    ASSERT_NE(tcp, nullptr);
+    const auto batch_id = engine.allocateBatchID(1);
+    auto& task = AddEventTask(batch_id, 1, tcp);
+    auto& batch = Transport::toBatchDesc(batch_id);
+    auto producer = std::async(std::launch::async,
+                               [&] { task.slice_list[0]->markSuccess(); });
+    {
+        std::unique_lock<std::mutex> lock(batch.completion_mutex);
+        batch.completion_cv.wait(lock, [&] {
+            return batch.is_finished.load(std::memory_order_acquire);
+        });
+    }
+    producer.get();
+    // The test owner retains BatchID until the CV borrower has exited.
+    Status release = engine.freeBatchID(batch_id);
+    EXPECT_TRUE(release.IsBatchBusy());
+    if (release.ok())
+        return;  // The failing baseline already deleted the batch.
+    TransferStatus status;
+    EXPECT_TRUE(engine.getBatchTransferStatus(batch_id, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
+}
+
+TEST_F(TransportTest, EventCompletionFailedSliceWithPendingSameTaskStaysBusy) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:17965"), 0);
+    Transport* tcp = engine.installTransport("tcp", nullptr);
+    ASSERT_NE(tcp, nullptr);
+    const auto batch_id = engine.allocateBatchID(1);
+    auto& task = AddEventTask(batch_id, 2, tcp);
+    task.slice_list[0]->markFailed();
+    TransferStatus status;
+    EXPECT_TRUE(engine.getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::WAITING);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).IsBatchBusy());
+    task.slice_list[1]->markSuccess();
+    EXPECT_TRUE(engine.getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
+}
+
+TEST_F(TransportTest, EventCompletionFailedBatchSummaryNeedsRemainingQuery) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:17966"), 0);
+    Transport* tcp = engine.installTransport("tcp", nullptr);
+    ASSERT_NE(tcp, nullptr);
+    const auto batch_id = engine.allocateBatchID(2);
+    auto& first = AddEventTask(batch_id, 1, tcp);
+    auto& second = AddEventTask(batch_id, 1, tcp);
+    first.slice_list[0]->markFailed();
+    TransferStatus status;
+    EXPECT_TRUE(engine.getBatchTransferStatus(batch_id, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).IsBatchBusy());
+    second.slice_list[0]->markSuccess();
+    // Repeated batch queries still return at the first failed task. They must
+    // not populate the later task's query flag or manufacture release safety.
+    EXPECT_TRUE(engine.getBatchTransferStatus(batch_id, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    Status release = engine.freeBatchID(batch_id);
+    EXPECT_TRUE(release.IsBatchBusy());
+    if (release.ok()) return;
+    EXPECT_TRUE(engine.getTransferStatus(batch_id, 1, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
+}
+
+// Submission scripting only; all status queries use the actual TCP transport
+// method, and all terminal publication uses the production Slice methods.
+class EventSliceSubmissionTransport : public BatchResultTransport {
+   public:
+    explicit EventSliceSubmissionTransport(std::shared_ptr<Transport> tcp)
+        : tcp_(std::move(tcp)) {}
+
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        for (auto* task : tasks) {
+            task->slice_count = 1;
+            auto* first = addSlice(task);
+            first->markSuccess();
+            completed_before_submit_return =
+                toBatchDesc(task->batch_id).is_finished.load();
+            __atomic_add_fetch(&task->slice_count, 1, __ATOMIC_ACQ_REL);
+            pending_.push_back(addSlice(task));
+        }
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID batch_id, size_t task_id,
+                             TransferStatus& status) override {
+        return tcp_->getTransferStatus(batch_id, task_id, status);
+    }
+
+    void completePending() {
+        auto slices = std::move(pending_);
+        for (auto* slice : slices) slice->markSuccess();
+    }
+
+    const char* getName() const override { return "event-slices"; }
+
+    bool completed_before_submit_return = false;
+
+   private:
+    static Slice* addSlice(TransferTask* task) {
+        auto* slice = new Slice{};
+        slice->task = task;
+        slice->length = 1;
+        slice->status = Slice::PENDING;
+        task->slice_list.push_back(slice);
+        return slice;
+    }
+
+    std::shared_ptr<Transport> tcp_;
+    std::vector<Slice*> pending_;
+};
+
+TEST_F(TransportTest, EventCompletionSingleRequestWaitsForSubmissionSeal) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:17967"), 0);
+    ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    auto tcp = TransferEngineImplTestPeer::transport(impl, "tcp");
+    auto scripted = std::make_shared<EventSliceSubmissionTransport>(tcp);
+    TransferEngineImplTestPeer::replaceTransports(impl,
+                                                  {{"event-slices", scripted}});
+    constexpr SegmentID kSegmentId = 42;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "event-remote";
+    descriptor->protocol = "event-slices";
+    impl.getMetadata()->addLocalSegment(kSegmentId, "event-remote",
+                                        std::move(descriptor));
+    char payload = 'p';
+    std::vector<TransferRequest> requests{
+        {TransferRequest::WRITE, &payload, kSegmentId, 0, 2}};
+    const auto batch_id = engine.allocateBatchID(1);
+    ASSERT_TRUE(engine.submitTransfer(batch_id, requests).ok());
+    EXPECT_FALSE(scripted->completed_before_submit_return);
+    EXPECT_FALSE(Transport::toBatchDesc(batch_id).is_finished.load());
+    TransferStatus status;
+    EXPECT_TRUE(engine.getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::WAITING);
+    Status release = engine.freeBatchID(batch_id);
+    EXPECT_TRUE(release.IsBatchBusy());
+    if (release.ok()) return;
+    scripted->completePending();
+    EXPECT_TRUE(engine.getBatchTransferStatus(batch_id, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
+}
+#endif  // USE_TCP
 #endif
 
 }  // namespace mooncake
