@@ -204,6 +204,12 @@ class Transport {
 
        public:
         void markSuccess() {
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            // Pollers may publish task completion as soon as the counters
+            // change. Join freeBatchID before exposing any terminal counter.
+            std::lock_guard<std::mutex> lock(
+                toBatchDesc(task->batch_id).completion_mutex);
+#endif
             status = Slice::SUCCESS;
             __atomic_fetch_add(&task->transferred_bytes, length,
                                __ATOMIC_RELAXED);
@@ -213,6 +219,10 @@ class Transport {
         }
 
         void markFailed() {
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            std::lock_guard<std::mutex> lock(
+                toBatchDesc(task->batch_id).completion_mutex);
+#endif
             status = Slice::FAILED;
             __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_ACQ_REL);
 
@@ -221,6 +231,8 @@ class Transport {
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         static void sealTaskSubmission(TransferTask *task) {
+            std::lock_guard<std::mutex> lock(
+                toBatchDesc(task->batch_id).completion_mutex);
             __atomic_store_n(&task->submission_sealed, true, __ATOMIC_RELEASE);
             check_batch_completion(task, false, false);
         }
@@ -233,6 +245,9 @@ class Transport {
                                                   bool is_failed,
                                                   bool count_slice = true) {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
+            // markSuccess/markFailed/sealTaskSubmission hold completion_mutex
+            // until this helper has stopped borrowing the batch, including
+            // notification. task.is_finished is owned by status queries.
             auto &batch_desc = toBatchDesc(task->batch_id);
             if (is_failed) {
                 batch_desc.has_failure.store(true, std::memory_order_relaxed);
@@ -248,8 +263,6 @@ class Transport {
                     __atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE) &&
                 !__atomic_exchange_n(&task->completion_published, true,
                                      __ATOMIC_ACQ_REL)) {
-                __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
-
                 // Increment the number of finished tasks in the batch
                 // (relaxed). This counter does not itself publish data; only
                 // the thread that observes the last task completion performs
@@ -263,23 +276,10 @@ class Transport {
 
                 // Last task in the batch: wake up waiting thread directly
                 if (prev + 1 == batch_desc.batch_size) {
-                    // Publish completion of the entire batch under the same
-                    // mutex used by the waiter to avoid lost notifications.
-                    //
-                    // Keep a release-store because the reader has a fast path
-                    // that may observe completion without taking the mutex. The
-                    // acquire load in that fast path pairs with this release to
-                    // make all prior updates visible. For the predicate checked
-                    // under the mutex, relaxed would suffice since the mutex
-                    // acquire provides the necessary visibility.
-                    {
-                        std::lock_guard<std::mutex> lock(
-                            batch_desc.completion_mutex);
-                        batch_desc.is_finished.store(true,
-                                                     std::memory_order_release);
-                    }
-                    // Notify after releasing the lock to avoid waking threads
-                    // only to block again on the mutex.
+                    // Publish and notify before releasing completion_mutex.
+                    // freeBatchID joins this mutex before deleting BatchDesc.
+                    batch_desc.is_finished.store(true,
+                                                 std::memory_order_release);
                     batch_desc.completion_cv.notify_all();
                 }
             }
@@ -406,6 +406,9 @@ class Transport {
     virtual BatchID allocateBatchID(size_t batch_size);
 
     /// @brief Free an allocated batch.
+    /// The caller must own the batch and serialize submission, queries, waiting
+    /// and release. Event/CV completion alone does not set query-owned task
+    /// terminal flags: query each task before release, or free returns Busy.
     virtual Status freeBatchID(BatchID batch_id);
 
     /// @brief Submit a batch of transfer requests to the batch.

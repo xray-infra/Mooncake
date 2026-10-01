@@ -107,13 +107,24 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
 
 Status MultiTransport::freeBatchID(BatchID batch_id) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
-    const size_t task_count = batch_desc.task_list.size();
-    for (size_t task_id = 0; task_id < task_count; task_id++) {
-        if (!batch_desc.task_list[task_id].is_finished) {
-            return Status::BatchBusy(
-                "BatchID cannot be freed until all tasks are done");
+    {
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        std::lock_guard<std::mutex> lock(batch_desc.completion_mutex);
+#endif
+        const size_t task_count = batch_desc.task_list.size();
+        for (size_t task_id = 0; task_id < task_count; task_id++) {
+            if (!batch_desc.task_list[task_id].is_finished) {
+                return Status::BatchBusy(
+                    "BatchID cannot be freed until all tasks are done");
+            }
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            if (!batch_desc.task_list[task_id].submission_sealed) {
+                return Status::BatchBusy(
+                    "Batch submission has not been sealed");
+            }
+#endif
         }
-    }
+    }  // Never delete a mutex while this call still holds it.
     delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
     RWSpinlock::WriteGuard guard(batch_desc_lock_);
@@ -172,7 +183,9 @@ Status MultiTransport::submitTransfer(
 #endif
         task.request_count = count;
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-        if (count > 1) task.submission_sealed = false;
+        // Even one request may append multiple slices while early slices
+        // finish.
+        task.submission_sealed = false;
 #endif
         submit_tasks[transports[i]].push_back(&task);
         if (task_sizes) task_sizes->push_back(count);
@@ -184,8 +197,7 @@ Status MultiTransport::submitTransfer(
         auto status = entry.first->submitTransferTask(entry.second);
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         for (auto* task : entry.second)
-            if (task->request_count > 1)
-                Transport::Slice::sealTaskSubmission(task);
+            Transport::Slice::sealTaskSubmission(task);
 #endif
         if (!status.ok()) {
             // LOG(ERROR) << "Failed to submit transfer task to "
@@ -232,6 +244,9 @@ Status MultiTransport::mp_submitTransfer(
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
         task.transport_ = transport;
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        task.submission_sealed = false;
+#endif
 #ifdef USE_ASCEND_HETEROGENEOUS
         task.request = const_cast<Transport::TransferRequest*>(&request);
 #else
@@ -243,6 +258,10 @@ Status MultiTransport::mp_submitTransfer(
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        for (auto* task : entry.second)
+            Transport::Slice::sealTaskSubmission(task);
+#endif
         if (!status.ok()) {
             // LOG(ERROR) << "Failed to submit transfer task to "
             //            << entry.first->getName();
@@ -366,8 +385,13 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;
 
-    if (batch_desc.is_finished.load(std::memory_order_acquire) ||
-        task_count == 0) {
+    // Event notification does not populate query-owned task terminal flags.
+    // Query every nonempty task so a successful batch query permits release.
+    if (task_count == 0
+#ifndef USE_EVENT_DRIVEN_COMPLETION
+        || batch_desc.is_finished.load(std::memory_order_acquire)
+#endif
+    ) {
         status.s = Transport::TransferStatusEnum::COMPLETED;
         status.transferred_bytes =
             batch_desc.finished_transfer_bytes.load(std::memory_order_relaxed);
@@ -398,9 +422,17 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
                    ? Transport::TransferStatusEnum::COMPLETED
                    : Transport::TransferStatusEnum::WAITING;
     if (status.s == Transport::TransferStatusEnum::COMPLETED) {
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        std::lock_guard<std::mutex> lock(batch_desc.completion_mutex);
+        batch_desc.finished_transfer_bytes.store(status.transferred_bytes,
+                                                 std::memory_order_release);
+        batch_desc.is_finished.store(true, std::memory_order_release);
+        batch_desc.completion_cv.notify_all();
+#else
         batch_desc.is_finished.store(true, std::memory_order_release);
         batch_desc.finished_transfer_bytes.store(status.transferred_bytes,
                                                  std::memory_order_release);
+#endif
     } else if (status.s == Transport::TransferStatusEnum::FAILED) {
         batch_desc.has_failure.store(true, std::memory_order_release);
     }
