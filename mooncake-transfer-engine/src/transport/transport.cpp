@@ -41,14 +41,26 @@ Transport::BatchID Transport::allocateBatchID(size_t batch_size) {
 
 Status Transport::freeBatchID(BatchID batch_id) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
-    const size_t task_count = batch_desc.task_list.size();
-    for (size_t task_id = 0; task_id < task_count; task_id++) {
-        if (!batch_desc.task_list[task_id].is_finished) {
-            LOG(ERROR) << "BatchID cannot be freed until all tasks are done";
-            return Status::BatchBusy(
-                "BatchID cannot be freed until all tasks are done");
+    {
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        std::lock_guard<std::mutex> lock(batch_desc.completion_mutex);
+#endif
+        const size_t task_count = batch_desc.task_list.size();
+        for (size_t task_id = 0; task_id < task_count; task_id++) {
+            if (!batch_desc.task_list[task_id].is_finished) {
+                LOG(ERROR)
+                    << "BatchID cannot be freed until all tasks are done";
+                return Status::BatchBusy(
+                    "BatchID cannot be freed until all tasks are done");
+            }
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            if (!batch_desc.task_list[task_id].submission_sealed) {
+                return Status::BatchBusy(
+                    "Batch submission has not been sealed");
+            }
+#endif
         }
-    }
+    }  // Never delete a mutex while this call still holds it.
     delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
     RWSpinlock::WriteGuard guard(batch_desc_lock_);
