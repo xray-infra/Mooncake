@@ -1,0 +1,332 @@
+name: Cache native CPU validation
+
+on:
+  push:
+    branches: [cache-native-cpu-validation]
+    paths: [.github/workflows/cache-native-cpu-validation.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-native-cpu-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CI_SOURCE_SHA: 43197bae9dc6b58d912324c494eed9ae97bf16cb
+      CI_TE_SOURCE_SHA: 061834a12390627377cff7716164fe9dcbe29e95
+      EVIDENCE_DIR: ${{ github.workspace }}/evidence
+    steps:
+      - name: Check out the frozen Store patch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 43197bae9dc6b58d912324c494eed9ae97bf16cb
+          path: source
+          submodules: true
+          persist-credentials: false
+
+      - name: Check out the frozen TE patch and identical regression tests
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: 061834a12390627377cff7716164fe9dcbe29e95
+          path: te-source
+          submodules: true
+          persist-credentials: false
+
+      - name: Record the source and runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          test "$(git -C source rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          test "$(git -C te-source rev-parse HEAD)" = "$CI_TE_SOURCE_SHA"
+          {
+            echo "workflow_sha=$GITHUB_SHA"
+            echo "tested_source_sha=$CI_SOURCE_SHA"
+            echo "tested_te_source_sha=$CI_TE_SOURCE_SHA"
+            echo "runner_image_os=${ImageOS:-unknown}"
+            echo "runner_image_version=${ImageVersion:-unknown}"
+            uname -a
+            df -h .
+            git -C source submodule status
+            git -C te-source submodule status
+          } | tee "$EVIDENCE_DIR/metadata.log"
+
+      - name: Install Linux CPU build dependencies
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            sudo apt-get update
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              build-essential cmake ninja-build git pkg-config python3-dev \
+              libibverbs-dev libgoogle-glog-dev libgflags-dev libjsoncpp-dev \
+              libunwind-dev libnuma-dev libboost-all-dev libssl-dev libyaml-cpp-dev \
+              libcurl4-openssl-dev liburing-dev libzstd-dev libasio-dev libxxhash-dev libmsgpack-cxx-dev
+            cmake --version
+            c++ --version
+            dpkg-query -W -f='${Package} ${Version}\n'
+          } 2>&1 | tee "$EVIDENCE_DIR/dependencies.log"
+
+      - name: Build and run classic and event CPU checks
+        timeout-minutes: 45
+        shell: bash
+        run: |
+          set -euo pipefail
+          common_flags=(
+            -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_DEBUG_SYMBOLS=OFF
+            -DWITH_TE=ON -DWITH_STORE=ON -DWITH_STORE_RUST=OFF
+            -DWITH_P2P_STORE=OFF -DWITH_EP=OFF
+            -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF
+            -DUSE_CUDA=OFF -DCMAKE_DISABLE_FIND_PACKAGE_CUDAToolkit=TRUE
+            -DUSE_TENT=OFF -DUSE_TCP=ON -DUSE_HTTP=ON
+            -DUSE_ETCD=OFF -DUSE_REDIS=OFF -DSTORE_USE_ETCD=OFF
+            -DSTORE_USE_REDIS=OFF -DSTORE_USE_K8S_LEASE=OFF
+            -DUSE_NOF=OFF -DUSE_3FS=OFF -DUSE_CXL=OFF -DUSE_EFA=OFF
+            -DENABLE_KV_EVENTS=OFF -DSTORE_USE_JEMALLOC=OFF
+          )
+          for mode in classic event; do
+            build_dir="$GITHUB_WORKSPACE/build-$mode"
+            event_flag=OFF
+            targets=(transfer_task_test)
+            filter='TransferTaskTest.ReleaseSafe*'
+            if [[ "$mode" == event ]]; then
+              event_flag=ON
+              targets+=(rdma_async_event_drain_test)
+              filter='TransferTaskTest.ReleaseSafeRejectsEventBeforeBatchAllocation'
+            fi
+            cmake -S source -B "$build_dir" "${common_flags[@]}" \
+              "-DUSE_EVENT_DRIVEN_COMPLETION=$event_flag" \
+              2>&1 | tee "$EVIDENCE_DIR/$mode-configure.log"
+            cmake --build "$build_dir" --target "${targets[@]}" --parallel 2 \
+              2>&1 | tee "$EVIDENCE_DIR/$mode-build.log"
+            test_bin="$build_dir/mooncake-store/tests/transfer_task_test"
+            "$test_bin" --gtest_list_tests 2>&1 | tee "$EVIDENCE_DIR/$mode-test-list.log"
+            timeout 180s "$test_bin" "--gtest_filter=$filter" \
+              "--gtest_output=xml:$EVIDENCE_DIR/$mode-release-safe.xml" \
+              2>&1 | tee "$EVIDENCE_DIR/$mode-release-safe.log"
+            python3 - "$mode" "$EVIDENCE_DIR/$mode-release-safe.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          mode, filename = sys.argv[1:]
+          cases = ET.parse(filename).getroot().findall(".//testcase")
+          by_name = {case.attrib["name"]: case for case in cases}
+          assert len(by_name) == len(cases) and cases, "Empty or duplicate GTest result"
+          assert not any(case.find("failure") is not None or case.find("error") is not None
+                         for case in cases), "GTest failure"
+          skipped = {name for name, case in by_name.items()
+                     if case.find("skipped") is not None or case.get("result") == "skipped"}
+          assert all(case.get("status") == "run" and case.get("result") == "completed"
+                     for name, case in by_name.items() if name not in skipped), "Case was not executed"
+          if mode == "classic":
+              expected = {
+                  "ReleaseSafeTimeoutRemainsFailedAfterLateCompletion",
+                  "ReleaseSafeDelayedConsumerKeepsCompletedSuccess",
+                  "ReleaseSafeQueryErrorRetainsBusyBatch",
+                  "ReleaseSafeFailedTaskDoesNotReleaseOtherTask",
+                  "ReleaseSafePartialSubmitKeepsBorrowedRequests",
+                  "ReleaseSafeConcurrentWaitersReleaseOnce",
+                  "ReleaseSafeDestructorWaitsForLateCompletion",
+                  "ReleaseSafeSubmitErrorReturnsOwnedFailedFuture",
+                  "ReleaseSafeTcpSubmitOwnsRequestsThroughCompletion",
+              }
+              expected_skips = {"ReleaseSafeRejectsTentBeforeBatchAllocation",
+                                "ReleaseSafeRejectsEventBeforeBatchAllocation"}
+              assert set(by_name) == expected | expected_skips, set(by_name)
+              assert skipped == expected_skips, skipped
+          else:
+              assert set(by_name) == {"ReleaseSafeRejectsEventBeforeBatchAllocation"}, by_name
+              assert not skipped, "Event rejection case must execute, not skip"
+          print(f"{mode}: {len(cases) - len(skipped)} executed, {len(skipped)} skipped")
+          PY
+            ctest_pattern='^transfer_task_test$'
+            if [[ "$mode" == event ]]; then
+              ctest_pattern='^rdma_async_event_drain_test$'
+            fi
+            ctest --test-dir "$build_dir" -N -R "$ctest_pattern" \
+              2>&1 | tee "$EVIDENCE_DIR/$mode-ctest-list.log"
+            GTEST_OUTPUT="xml:$EVIDENCE_DIR/$mode-whole-gtest.xml" \
+              ctest --test-dir "$build_dir" -R "$ctest_pattern" --no-tests=error \
+              --timeout 180 -j1 --output-on-failure \
+              --output-junit "$EVIDENCE_DIR/$mode-ctest.xml" \
+              2>&1 | tee "$EVIDENCE_DIR/$mode-ctest.log"
+            python3 - "$mode" "$EVIDENCE_DIR/$mode-ctest.xml" "$EVIDENCE_DIR/$mode-whole-gtest.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          mode, ctest_file, gtest_file = sys.argv[1:]
+          cases = ET.parse(ctest_file).getroot().findall(".//testcase")
+          assert len(cases) == 1, "Expected one registered CTest target"
+          assert not any(case.find(tag) is not None for case in cases
+                         for tag in ("failure", "error", "skipped")), "CTest did not execute successfully"
+          native_cases = ET.parse(gtest_file).getroot().findall(".//testcase")
+          assert native_cases, "Registered binary executed no GTest cases"
+          executed = [case for case in native_cases
+                      if case.get("status") == "run" and case.get("result") == "completed"]
+          assert executed, "Registered binary executed only skipped cases"
+          assert not any(case.find("failure") is not None or case.find("error") is not None
+                         for case in native_cases), "Native GTest failure"
+          if mode == "event":
+              assert len(executed) == len(native_cases), "Async-fd regression must not skip"
+          print(f"{mode} whole target: {len(executed)} executed of {len(native_cases)} cases")
+          PY
+            if [[ -d "$build_dir/Testing/Temporary" ]]; then
+              cp "$build_dir/Testing/Temporary/LastTest.log" "$EVIDENCE_DIR/$mode-last-test.log"
+            fi
+            if [[ "$mode" == event ]]; then
+              # Only the regression test file is overlaid; production remains 43197.
+              cp te-source/mooncake-transfer-engine/tests/transport_uint_test.cpp \
+                source/mooncake-transfer-engine/tests/transport_uint_test.cpp
+              cmp te-source/mooncake-transfer-engine/tests/transport_uint_test.cpp \
+                source/mooncake-transfer-engine/tests/transport_uint_test.cpp
+              sha256sum te-source/mooncake-transfer-engine/tests/transport_uint_test.cpp \
+                source/mooncake-transfer-engine/tests/transport_uint_test.cpp \
+                | tee "$EVIDENCE_DIR/te-identical-test-hashes.log"
+              git -C source diff --stat | tee "$EVIDENCE_DIR/te-baseline-overlay.log"
+              test "$(git -C source diff --name-only)" = \
+                mooncake-transfer-engine/tests/transport_uint_test.cpp
+              cmake --build "$build_dir" --target transport_uint_test --parallel 2 \
+                2>&1 | tee "$EVIDENCE_DIR/te-baseline-build.log"
+              te_bin="$build_dir/mooncake-transfer-engine/tests/transport_uint_test"
+              te_filter='TransportTest.EventCompletion*:TransportTest.GroupedTaskCompletionWaitsForSubmissionSeal'
+              "$te_bin" --gtest_list_tests 2>&1 | tee "$EVIDENCE_DIR/te-baseline-list.log"
+              set +e
+              timeout 180s "$te_bin" "--gtest_filter=$te_filter" \
+                "--gtest_output=xml:$EVIDENCE_DIR/te-baseline.xml" \
+                2>&1 | tee "$EVIDENCE_DIR/te-baseline.log"
+              baseline_pipeline=("${PIPESTATUS[@]}")
+              set -e
+              # Timeout, crash, missing symbols or empty filters are not runtime RED.
+              test "${baseline_pipeline[0]}" -eq 1
+              test "${baseline_pipeline[1]}" -eq 0
+              python3 - "$EVIDENCE_DIR/te-baseline.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          cases = ET.parse(sys.argv[1]).getroot().findall(".//testcase")
+          by_name = {case.attrib["name"]: case for case in cases}
+          expected_failures = {
+              "EventCompletionProducerLocksBeforeCounters",
+              "EventCompletionMultiFreeJoinsMutex",
+              "EventCompletionBaseFreeJoinsMutex",
+              "EventCompletionCvRequiresRealBatchQueryBeforeFree",
+              "EventCompletionFailedBatchSummaryNeedsRemainingQuery",
+              "EventCompletionSingleRequestWaitsForSubmissionSeal",
+              "GroupedTaskCompletionWaitsForSubmissionSeal",
+          }
+          control = "EventCompletionFailedSliceWithPendingSameTaskStaysBusy"
+          assert len(cases) == 8 and set(by_name) == expected_failures | {control}, by_name
+          assert all(case.get("status") == "run" and case.get("result") == "completed"
+                     and case.find("skipped") is None and case.find("error") is None
+                     for case in cases), "Baseline must execute every case"
+          failures = {name for name, case in by_name.items() if case.find("failure") is not None}
+          assert failures == expected_failures, failures
+          print("Baseline runtime RED: 6 of 7 new cases fail, control passes; existing grouped case fails")
+          PY
+            fi
+            rm -rf "$build_dir"
+          done
+          # Build actual patched TE production code with the same test file.
+          build_dir="$GITHUB_WORKSPACE/build-te-patch"
+          cmake -S te-source -B "$build_dir" "${common_flags[@]}" \
+            -DWITH_STORE=OFF -DUSE_EVENT_DRIVEN_COMPLETION=ON \
+            2>&1 | tee "$EVIDENCE_DIR/te-patch-configure.log"
+          cmake --build "$build_dir" --target transport_uint_test --parallel 2 \
+            2>&1 | tee "$EVIDENCE_DIR/te-patch-build.log"
+          te_bin="$build_dir/mooncake-transfer-engine/tests/transport_uint_test"
+          "$te_bin" --gtest_list_tests 2>&1 | tee "$EVIDENCE_DIR/te-patch-list.log"
+          ctest --test-dir "$build_dir" -N -R '^transport_uint_test$' \
+            2>&1 | tee "$EVIDENCE_DIR/te-patch-ctest-list.log"
+          GTEST_FILTER="$te_filter" GTEST_OUTPUT="xml:$EVIDENCE_DIR/te-patch.xml" \
+            ctest --test-dir "$build_dir" -R '^transport_uint_test$' --no-tests=error \
+            --timeout 180 -j1 --output-on-failure \
+            --output-junit "$EVIDENCE_DIR/te-patch-ctest.xml" \
+            2>&1 | tee "$EVIDENCE_DIR/te-patch.log"
+          python3 - "$EVIDENCE_DIR/te-patch.xml" "$EVIDENCE_DIR/te-patch-ctest.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          expected = {
+              "EventCompletionProducerLocksBeforeCounters",
+              "EventCompletionMultiFreeJoinsMutex",
+              "EventCompletionBaseFreeJoinsMutex",
+              "EventCompletionCvRequiresRealBatchQueryBeforeFree",
+              "EventCompletionFailedSliceWithPendingSameTaskStaysBusy",
+              "EventCompletionFailedBatchSummaryNeedsRemainingQuery",
+              "EventCompletionSingleRequestWaitsForSubmissionSeal",
+              "GroupedTaskCompletionWaitsForSubmissionSeal",
+          }
+          cases = ET.parse(sys.argv[1]).getroot().findall(".//testcase")
+          assert len(cases) == 8 and {case.get("name") for case in cases} == expected, cases
+          assert all(case.get("status") == "run" and case.get("result") == "completed"
+                     and all(case.find(tag) is None for tag in ("failure", "error", "skipped"))
+                     for case in cases), "Patched TE case must run successfully without skip"
+          ctest = ET.parse(sys.argv[2]).getroot().findall(".//testcase")
+          assert len(ctest) == 1 and all(ctest[0].find(tag) is None
+                                      for tag in ("failure", "error", "skipped")), ctest
+          print("Patched TE GREEN: 7 new cases and 1 existing grouped case execute successfully")
+          PY
+          cp "$build_dir/Testing/Temporary/LastTest.log" "$EVIDENCE_DIR/te-patch-last-test.log"
+          rm -rf "$build_dir"
+
+      - name: Preserve bounded diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          for mode in classic event te-patch; do
+            test_logs="$GITHUB_WORKSPACE/build-$mode/Testing/Temporary"
+            if [[ -d "$test_logs" ]]; then
+              for filename in LastTest.log LastTestsFailed.log; do
+                if [[ -f "$test_logs/$filename" ]]; then
+                  cp "$test_logs/$filename" "$EVIDENCE_DIR/$mode-$filename"
+                fi
+              done
+            fi
+          done
+          python3 - "$EVIDENCE_DIR" <<'PY'
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          truncated = []
+          for path in root.glob("*.log"):
+              if path.stat().st_size > 1024 * 1024:
+                  with path.open("rb") as source:
+                      source.seek(-1024 * 1024, 2)
+                      tail = source.read()
+                  path.write_bytes(b"[TRUNCATED: preserved final 1 MiB]\n" + tail)
+                  truncated.append(path.name)
+          total = sum(path.stat().st_size for path in root.iterdir() if path.is_file())
+          assert total <= 20 * 1024 * 1024, f"Diagnostic payload exceeds limit: {total}"
+          (root / "artifact-scope.txt").write_text(
+              "Logs/XML/metadata only; no build binaries.\n"
+              f"Payload bytes: {total}\nTruncated logs: {truncated}\n"
+          )
+          PY
+          {
+            echo "### Native CPU validation"
+            echo "Workflow SHA: \`$GITHUB_SHA\`"
+            echo "Tested source: \`$CI_SOURCE_SHA\`"
+            echo "Tested TE patch: \`$CI_TE_SOURCE_SHA\`"
+            echo "Classic history/TCP and event rejection/async-fd checks only."
+            echo "TE baseline runtime RED and patched GREEN use identical native tests."
+            echo "TENT, GPU/RDMA, device quiescence and performance remain outside this run."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs and XML only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cache-native-cpu-${{ github.run_id }}
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 9
