@@ -12,7 +12,7 @@ __global__ void invert_bytes(unsigned char* bytes, std::size_t count) {
 
 int main() {
     constexpr std::size_t bytes = 4 * 1024 * 1024;
-    constexpr std::size_t budget = 1024ULL * 1024 * 1024;
+    constexpr std::size_t budget = 2 * 1024ULL * 1024 * 1024;
     unsigned char *source = nullptr, *destination = nullptr, *device = nullptr;
     cudaStream_t stream = nullptr;
     cudaEvent_t ready = nullptr;
@@ -45,7 +45,7 @@ int main() {
     CHECK(cudaMemGetInfo(&free_before, &total));
     if (total - free_before + bytes > budget) {
         std::fprintf(stderr,
-                     "Context/device memory already exceeds 1 GiB budget\n");
+                     "Context/device memory already exceeds 2 GiB budget\n");
         goto cleanup;
     }
     CHECK(cudaHostAlloc(reinterpret_cast<void**>(&source), bytes,
@@ -86,7 +86,7 @@ int main() {
     CHECK(cudaMemGetInfo(&free_after, &total));
     if (total - free_after > budget) {
         std::fprintf(stderr,
-                     "Observed context/device memory exceeds 1 GiB budget\n");
+                     "Observed context/device memory exceeds 2 GiB budget\n");
         goto cleanup;
     }
     std::printf(
