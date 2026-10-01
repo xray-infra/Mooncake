@@ -733,181 +733,89 @@ void MemcpyWorkerPool::workerThread() {
 // TransferEngineOperationState Implementation
 // ============================================================================
 
+TransferEngineOperationState::~TransferEngineOperationState() {
+    // Dropping a future does not cancel DMA. Retain the batch and borrowed
+    // request descriptors until TE accepts release. The engine must still live.
+    wait_for_completion();
+}
+
 bool TransferEngineOperationState::is_completed() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (result_.has_value()) {
-        return true;
+    if (!result_.has_value()) {
+        check_task_status();
     }
-
-    check_task_status();
     return result_.has_value();
 }
 
 void TransferEngineOperationState::check_task_status() {
-    // Check all transfers in the batch.
-    // Wait for ALL tasks to reach a terminal state before setting the result,
-    // even if some have already failed. This prevents the caller from seeing
-    // "completed" while background transfers are still in progress, which
-    // could cause issues when freeBatchID is called in the destructor.
-    bool all_terminated = true;
-    std::vector<size_t> failed_task_ids;
+    // mutex_ serializes all queries and release. Once release succeeds, BatchID
+    // is a dangling pointer and must never be queried or freed again.
+    if (result_.has_value()) return;
 
-    for (size_t i = 0; i < batch_size_; ++i) {
+    // A query error or a failed task does not prove the remaining tasks are
+    // quiescent. Poll every task so transports requiring polling still
+    // progress.
+    for (size_t i = 0; i < requests_.size(); ++i) {
         TransferStatus status;
         Status s = engine_.getTransferStatus(batch_id_, i, status);
         if (!s.ok()) {
-            LOG(ERROR) << "Failed to get transfer status for batch "
-                       << batch_id_ << " task " << i << " with error "
-                       << s.message();
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
-            return;
+            if (!transfer_failed_) {
+                LOG(ERROR) << "Failed to query transfer batch " << batch_id_
+                           << " task " << i << ": " << s.message();
+            }
+            transfer_failed_ = true;
+            continue;
         }
-
         switch (status.s) {
-            case TransferStatusEnum::COMPLETED:
-                // This transfer is done successfully
-                break;
             case TransferStatusEnum::FAILED:
             case TransferStatusEnum::CANCELED:
             case TransferStatusEnum::INVALID:
-#ifndef USE_ASCEND_DIRECT
-                VLOG(1) << "Transfer failed for batch " << batch_id_ << " task "
-                        << i << " with status " << static_cast<int>(status.s);
-#endif
-                failed_task_ids.push_back(i);
+            case TransferStatusEnum::TIMEOUT:
+                transfer_failed_ = true;
                 break;
             default:
-                // Transfer is still in progress (WAITING, PENDING, etc.)
-                all_terminated = false;
                 break;
         }
     }
 
-    if (!all_terminated) {
-        // Some tasks are still in progress; wait for next poll iteration.
-        // Do NOT set result yet, even if some tasks have already failed.
+    // Status enums (including TIMEOUT) are not release fences. The classic TE
+    // checks each task's physical terminal state in freeBatchID; Busy retains
+    // both the batch and the descriptor vector. This can wait indefinitely if
+    // a transport does not converge; a second timeout cannot make reuse safe.
+    Status released = engine_.freeBatchID(batch_id_);
+    if (!released.ok()) {
+        constexpr int64_t timeout_milliseconds = 60 * 1000;
+        if (!transfer_failed_ &&
+            getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
+            LOG(ERROR) << "Transfer batch " << batch_id_
+                       << " exceeded its logical timeout; waiting for safe "
+                          "release";
+            transfer_failed_ = true;
+        }
+        if (!released.IsBatchBusy() && !transfer_failed_) {
+            LOG(ERROR) << "Failed to release transfer batch " << batch_id_
+                       << ": " << released.message();
+            transfer_failed_ = true;
+        }
         return;
     }
 
-    // All tasks have reached a terminal state.
-    ErrorCode ec = ErrorCode::OK;
-    if (!failed_task_ids.empty()) {
-        std::ostringstream oss;
-        for (size_t j = 0; j < failed_task_ids.size(); ++j) {
-            if (j > 0) oss << ", ";
-            oss << failed_task_ids[j];
-        }
-        LOG(ERROR) << "Batch " << batch_id_
-                   << " completed with task failures: task_ids=[" << oss.str()
-                   << "]";
-        ec = ErrorCode::TRANSFER_FAIL;
-    }
-
-    set_result_internal(ec);
-}
-
-void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
-    if (result_.has_value()) {
-        LOG(ERROR) << "Attempting to set result multiple times for batch "
-                   << batch_id_
-                   << ". Previous result: " << static_cast<int>(result_.value())
-                   << ", attempted new result: " << static_cast<int>(error_code)
-                   << ". This indicates a race condition or logic error.";
-        return;  // Don't crash, just return early
-    }
-
-    VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
-            << static_cast<int>(error_code);
-    result_.emplace(error_code);
+    batch_id_ = INVALID_BATCH_ID;
+    result_.emplace(transfer_failed_ ? ErrorCode::TRANSFER_FAIL
+                                     : ErrorCode::OK);
+    cv_.notify_all();
 }
 
 void TransferEngineOperationState::wait_for_completion() {
-    if (is_completed()) {
-        return;
-    }
-
-    // 60 seconds
-    constexpr int64_t timeout_milliseconds = 60 * 1000;
-
-#ifdef USE_EVENT_DRIVEN_COMPLETION
-    VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
-
-    // Wait directly on BatchDesc's condition variable.
-    auto& batch_desc = Transport::toBatchDesc(batch_id_);
-    bool completed;
-    bool failed = false;
-
-    // Fast path: if already finished, avoid taking the mutex and waiting.
-    // Use acquire here to pair with the writer's release-store, because this
-    // path may skip taking the mutex. It ensures all prior updates are visible.
-    completed = batch_desc.is_finished.load(std::memory_order_acquire);
-    if (!completed) {
-        // Use the same mutex as the notifier when updating the predicate to
-        // avoid missed notifications. The predicate is re-checked under the
-        // lock. Under the mutex, relaxed is sufficient; the mutex acquire
-        // orders prior writes.
-        std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
-        const int64_t elapsed_milliseconds =
-            getCurrentTimeInMilli() - start_ts_;
-        if (elapsed_milliseconds < timeout_milliseconds) {
-            completed = batch_desc.completion_cv.wait_for(
-                lock,
-                std::chrono::milliseconds(timeout_milliseconds -
-                                          elapsed_milliseconds),
-                [&batch_desc] {
-                    return batch_desc.is_finished.load(
-                        std::memory_order_relaxed);
-                });
-        }
-    }  // Explicitly release completion_mutex before acquiring mutex_
-
-    // Once completion is observed, read failure flag.
-    if (completed) {
-        failed = batch_desc.has_failure.load(std::memory_order_relaxed);
-    }
-
-    ErrorCode error_code =
-        completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
-                  : ErrorCode::TRANSFER_FAIL;
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        set_result_internal(error_code);
-    }
-
-    if (completed) {
-        VLOG(1) << "Transfer engine operation completed for batch " << batch_id_
-                << " with result: " << static_cast<int>(error_code);
-    } else {
-        LOG(ERROR) << "Failed to complete transfers after "
-                   << timeout_milliseconds << " milliseconds for batch "
-                   << batch_id_;
-    }
-#else
-    VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
-
-    while (true) {
-        if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
-            LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_milliseconds << " milliseconds for batch "
-                       << batch_id_;
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
-            return;
-        }
-
-        std::unique_lock<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (!result_.has_value()) {
         check_task_status();
-        if (result_.has_value()) {
-            VLOG(1) << "Transfer engine operation completed for batch "
-                    << batch_id_
-                    << " with result: " << static_cast<int>(result_.value());
-            break;
+        if (!result_.has_value()) {
+            // Wait on our own CV, never borrow BatchDesc's CV across release.
+            // Other callers can poll under mutex_; only one can free the batch.
+            cv_.wait_for(lock, std::chrono::milliseconds(1));
         }
-        // Continue polling
-        VLOG(1) << "Transfer engine operation still pending for batch "
-                << batch_id_;
     }
-#endif
 }
 
 // ============================================================================
@@ -1238,6 +1146,17 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     std::vector<TransferRequest>& requests) {
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    // The event producer still accesses BatchDesc after publishing task
+    // completion. Store cannot establish safe release for that build yet.
+    LOG(ERROR) << "Store TE transfers require non-event-driven completion";
+    return std::nullopt;
+#endif
+    if (engine_.isUsingTent()) {
+        LOG(ERROR) << "Store TE safe release is only supported by classic TE";
+        return std::nullopt;
+    }
+
     // Allocate batch ID
     const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
@@ -1246,27 +1165,23 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         return std::nullopt;
     }
 
-    // Submit transfer
-    Status s = engine_.submitTransfer(batch_id, requests);
+    // Own the descriptors before TE can borrow them. A failed submission may
+    // already have posted work, so it must return an owned, draining future.
+    std::shared_ptr<TransferEngineOperationState> state;
+    try {
+        state = std::make_shared<TransferEngineOperationState>(
+            engine_, batch_id, std::move(requests));
+    } catch (...) {
+        // No submission has happened, so this empty batch has no borrowers.
+        engine_.freeBatchID(batch_id);
+        throw;
+    }
+    Status s = engine_.submitTransfer(batch_id, state->requests_);
     if (!s.ok()) {
         LOG(ERROR) << "Failed to submit all transfers, error code is "
                    << s.code();
-        // Note: batch_id will be freed by TransferEngineOperationState
-        // destructor if we create the state object, otherwise we need to free
-        // it here
-        engine_.freeBatchID(batch_id);
-        return std::nullopt;
+        state->transfer_failed_ = true;
     }
-
-    if (batch_id == INVALID_BATCH_ID) {  // INVALID_BATCH_ID
-        LOG(ERROR) << "Invalid batch ID for transfer engine operation";
-        return std::nullopt;
-    }
-
-    // Create state with transfer engine context - no polling thread
-    // needed
-    auto state = std::make_shared<TransferEngineOperationState>(
-        engine_, batch_id, batch_size);
 
     return TransferFuture(state);
 }

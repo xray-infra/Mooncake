@@ -216,14 +216,16 @@ class FilereadOperationState : public OperationState {
  */
 class TransferEngineOperationState : public OperationState {
    public:
+    // The engine and payload buffers must outlive this state. Only classic,
+    // non-event-driven TransferEngine batches are supported.
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
-                                 size_t batch_size)
+                                 std::vector<TransferRequest> requests)
         : engine_(engine),
           batch_id_(batch_id),
-          batch_size_(batch_size),
+          requests_(std::move(requests)),
           start_ts_(getCurrentTimeInMilli()) {}
 
-    ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
+    ~TransferEngineOperationState() override;
 
     bool is_completed() override;
 
@@ -241,12 +243,17 @@ class TransferEngineOperationState : public OperationState {
      */
     void check_task_status();
 
-    void set_result_internal(ErrorCode error_code);
-
     TransferEngine& engine_;
     BatchID batch_id_;
-    size_t batch_size_;
-    const int64_t start_ts_;
+    // Classic TE tasks borrow pointers into this vector during submission.
+    // Keep it alive until freeBatchID succeeds, including partial submit
+    // errors.
+    std::vector<TransferRequest> requests_;
+    int64_t start_ts_;
+    bool transfer_failed_ = false;
+
+    friend class TransferSubmitter;
+    friend class TransferTaskTestPeer;
 };
 
 /**
@@ -600,6 +607,7 @@ class TransferSubmitter {
                                       const std::string& local_endpoint);
 
    private:
+    friend class TransferTaskTestPeer;
     TransferEngine& engine_;
     // Cached at construction: the local transport endpoint never changes for
     // the lifetime of the TransferSubmitter, so we avoid calling
