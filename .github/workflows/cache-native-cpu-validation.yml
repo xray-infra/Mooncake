@@ -66,6 +66,8 @@ jobs:
       - name: Install Linux CPU build and Python dependencies
         timeout-minutes: 15
         shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/sglang-source/python
         run: |
           set -euo pipefail
           {
@@ -148,6 +150,15 @@ jobs:
           assert transformers.__version__ == "5.12.1", transformers.__version__
           assert tokenizers.__version__ == "0.22.2", tokenizers.__version__
           print(sys.version, torch.__version__, torchvision.__version__, transformers.__version__, tokenizers.__version__)
+          print("Normal CPU TorchVision extension and NMS passed")
+          # Normal consumer imports only; native Mooncake binding is built below.
+          import inspect
+          from sglang.srt.managers.scheduler import Scheduler
+          from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+          from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+          from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
+          for cls in (Scheduler, MHATokenToKVPool, MHATokenToKVPoolHost, MooncakeStore):
+              print("Normal SGLang import:", cls.__name__, inspect.getfile(cls))
           PY
             cmake --version
             c++ --version
