@@ -1,0 +1,395 @@
+name: Cache joint candidate CPU validation
+
+on:
+  push:
+    branches: [cache-joint-candidate-cpu]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-joint-candidate-cpu-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SG_SOURCE_SHA: c84c5091040cc30502f366c2c449e3707fbe2931
+      EVIDENCE_DIR: ${{ github.workspace }}/evidence
+      JOINT_VENV: ${{ github.workspace }}/joint-venv
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - name: Check out actual Mooncake candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: source
+          submodules: true
+          persist-credentials: false
+
+      - name: Check out frozen SGLang consumer
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: xray-infra/sglang
+          ref: c84c5091040cc30502f366c2c449e3707fbe2931
+          path: sglang-source
+          persist-credentials: false
+
+      - name: Record source and runner provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          test "$(git -C source rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C sglang-source rev-parse HEAD)" = "$SG_SOURCE_SHA"
+          {
+            echo "workflow_and_mooncake_source_sha=$GITHUB_SHA"
+            echo "sglang_source_sha=$SG_SOURCE_SHA"
+            echo "runner_image_os=${ImageOS:-unknown}"
+            echo "runner_image_version=${ImageVersion:-unknown}"
+            uname -a
+            df -h .
+            git -C source submodule status
+            sha256sum source/.github/workflows/cache-native-cpu-validation.yml \
+              source/pyproject.toml sglang-source/python/pyproject.toml \
+              sglang-source/test/manual/mem_cache/test_mooncake_joint_candidate.py
+            echo "Selected native C++/Python CPU interfaces, not either project's default build."
+            echo "Mooncake Rust stays configured ON; selected targets do not build Rust bindings."
+            echo "SGLang CUDA/Rust package build, GPU/RDMA, device drain and performance are untested."
+          } | tee "$EVIDENCE_DIR/metadata.log"
+
+      - name: Install Linux CPU build and Python dependencies
+        timeout-minutes: 15
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/sglang-source/python
+        run: |
+          set -euo pipefail
+          {
+            sudo apt-get update
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              build-essential cmake ninja-build git pkg-config python3-dev python3-venv \
+              libibverbs-dev libgoogle-glog-dev libgflags-dev libjsoncpp-dev \
+              libunwind-dev libnuma-dev libboost-all-dev libssl-dev libyaml-cpp-dev \
+              libcurl4-openssl-dev liburing-dev libzstd-dev libasio-dev libxxhash-dev libmsgpack-cxx-dev
+            python3 -m venv "$JOINT_VENV"
+            "$JOINT_VENV/bin/python" -m pip install --upgrade pip
+            "$JOINT_VENV/bin/python" -m pip install torch==2.13.0+cpu torchvision==0.28.0+cpu \
+              --index-url https://download.pytorch.org/whl/cpu
+            "$JOINT_VENV/bin/python" - "$EVIDENCE_DIR" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          import tomllib
+
+          # Explicit CPU interface environment, with the source declaration intact.
+          excluded = {
+              "cuda-python": "CUDA runtime interfaces",
+              "cuda-tile": "CUDA kernels",
+              "flash-attn-4": "GPU attention kernels",
+              "flashinfer_python": "CUDA attention/JIT kernels",
+              "humming-kernels": "CUDA kernels",
+              "nvidia-cutlass-dsl": "CUDA kernel generation",
+              "nvidia-mathdx": "CUDA device math",
+              "nvshmem4py-cu13": "GPU shared-memory runtime",
+              "quack-kernels": "CUDA kernels",
+              "sgl-deep-ep": "GPU expert communication",
+              "sgl-deep-gemm": "GPU GEMM kernels",
+              "sglang-kernel": "CUDA/HIP extension; normal CPU branches must avoid it",
+              "tilelang": "Device kernel compiler",
+              "tokenspeed_mla": "GPU MLA kernels",
+              "torchaudio": "Audio outside KV-cache entry; source pin differs from Torch",
+              "torchcodec": "Audio/video decoding outside KV-cache entry",
+              "torchvision": "Installed separately with matching Torch from the official CPU index; timm imports it",
+              "torch_memory_saver": "CUDA allocator; CPU pool normally disables memory saver",
+          }
+          declaration = tomllib.loads(Path("sglang-source/python/pyproject.toml").read_text())
+          requirements = []
+          for requirement in declaration["project"]["dependencies"]:
+              name = requirement.split("[", 1)[0]
+              for delimiter in ("==", ">=", "<=", ">", "<", ";", "~="):
+                  name = name.split(delimiter, 1)[0]
+              name = name.strip()
+              if name not in excluded and name != "torch":
+                  requirements.append(requirement)
+          # Real Triton decorators remain imported on CPU. Version follows
+          # Torch 2.13's dependency metadata, not a substituted module.
+          requirements.extend([
+              "triton==3.7.1", "av==16.1.0", "pytest", "parameterized",
+              "setuptools-rust>=1.11", "setuptools-scm>=8.0",
+          ])
+          root = Path(sys.argv[1])
+          (root / "cpu-interface-requirements.txt").write_text("\n".join(requirements) + "\n")
+          (root / "cpu-interface-exclusions.json").write_text(
+              json.dumps(excluded, sort_keys=True, indent=2) + "\n"
+          )
+          PY
+            "$JOINT_VENV/bin/python" -m pip install -r "$EVIDENCE_DIR/cpu-interface-requirements.txt"
+            "$JOINT_VENV/bin/python" -m pip freeze --all > "$EVIDENCE_DIR/python-resolved.txt"
+            "$JOINT_VENV/bin/python" -m pip check
+            "$JOINT_VENV/bin/python" - <<'PY'
+          import sys
+          import torch
+          import torchvision
+          import transformers
+          import tokenizers
+          from torchvision.ops import nms
+          assert sys.version_info[:2] == (3, 12), sys.version
+          assert torch.__version__ == "2.13.0+cpu", torch.__version__
+          assert torchvision.__version__ == "0.28.0+cpu", torchvision.__version__
+          assert torch.version.cuda is None and not torch.cuda.is_available()
+          assert torchvision.extension._has_ops(), "Normal TorchVision native extension did not load"
+          boxes = torch.tensor([[0., 0., 1., 1.], [0., 0., 1., 1.]])
+          scores = torch.tensor([0.9, 0.8])
+          assert nms(boxes, scores, 0.5).tolist() == [0], "Actual CPU NMS ABI preflight failed"
+          assert transformers.__version__ == "5.12.1", transformers.__version__
+          assert tokenizers.__version__ == "0.22.2", tokenizers.__version__
+          print(sys.version, torch.__version__, torchvision.__version__, transformers.__version__, tokenizers.__version__)
+          print("Normal CPU TorchVision extension and NMS passed")
+          # Normal consumer imports only; native Mooncake binding is built below.
+          import inspect
+          from sglang.srt.managers.scheduler import Scheduler
+          from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+          from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+          from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+          from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
+          for cls in (Scheduler, HiCacheStorageConfig, MHATokenToKVPool, MHATokenToKVPoolHost, MooncakeStore):
+              print("Normal SGLang import:", cls.__name__, inspect.getfile(cls))
+          PY
+            cmake --version
+            c++ --version
+            rustc --version
+            cargo --version
+            dpkg-query -W -f='${Package} ${Version}\n'
+          } 2>&1 | tee "$EVIDENCE_DIR/dependencies.log"
+
+      - name: Build actual candidate interfaces and run native regressions
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set -euo pipefail
+          common_flags=(
+            -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_DEBUG_SYMBOLS=OFF
+            -DWITH_TE=ON -DWITH_STORE=ON -DWITH_STORE_RUST=ON
+            -DWITH_P2P_STORE=OFF -DWITH_EP=OFF
+            -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF
+            -DUSE_CUDA=OFF -DCMAKE_DISABLE_FIND_PACKAGE_CUDAToolkit=TRUE
+            -DUSE_TENT=OFF -DUSE_TCP=ON -DUSE_HTTP=ON
+            -DUSE_ETCD=OFF -DUSE_REDIS=OFF -DSTORE_USE_ETCD=OFF
+            -DSTORE_USE_REDIS=OFF -DSTORE_USE_K8S_LEASE=OFF
+            -DUSE_NOF=OFF -DUSE_3FS=OFF -DUSE_CXL=OFF -DUSE_EFA=OFF
+            -DENABLE_KV_EVENTS=OFF -DSTORE_USE_JEMALLOC=OFF
+            "-DPYTHON_EXECUTABLE=$JOINT_VENV/bin/python"
+            "-DPython3_EXECUTABLE=$JOINT_VENV/bin/python"
+          )
+          for mode in classic event; do
+            build_dir="$GITHUB_WORKSPACE/build-$mode"
+            event_flag=OFF
+            targets=(transfer_task_test store engine mooncake_master)
+            filter='TransferTaskTest.ReleaseSafe*'
+            if [[ "$mode" == event ]]; then
+              event_flag=ON
+              targets=(transfer_task_test rdma_async_event_drain_test transport_uint_test)
+              filter='TransferTaskTest.ReleaseSafeRejectsEventBeforeBatchAllocation'
+            fi
+            cmake -S source -B "$build_dir" "${common_flags[@]}" \
+              "-DUSE_EVENT_DRIVEN_COMPLETION=$event_flag" \
+              2>&1 | tee "$EVIDENCE_DIR/$mode-configure.log"
+            cmake --build "$build_dir" --target "${targets[@]}" --parallel 2 \
+              2>&1 | tee "$EVIDENCE_DIR/$mode-build.log"
+            cp "$build_dir/CMakeCache.txt" "$EVIDENCE_DIR/$mode-CMakeCache.txt"
+            test_bin="$build_dir/mooncake-store/tests/transfer_task_test"
+            "$test_bin" --gtest_list_tests 2>&1 | tee "$EVIDENCE_DIR/$mode-test-list.log"
+            timeout 180s "$test_bin" "--gtest_filter=$filter" \
+              "--gtest_output=xml:$EVIDENCE_DIR/$mode-release-safe.xml" \
+              2>&1 | tee "$EVIDENCE_DIR/$mode-release-safe.log"
+            "$JOINT_VENV/bin/python" - "$mode" "$EVIDENCE_DIR/$mode-release-safe.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          mode, filename = sys.argv[1:]
+          cases = ET.parse(filename).getroot().findall(".//testcase")
+          by_name = {case.attrib["name"]: case for case in cases}
+          assert len(by_name) == len(cases) and cases, "Empty or duplicate GTest result"
+          assert not any(case.find("failure") is not None or case.find("error") is not None
+                         for case in cases), "GTest failure"
+          skipped = {name for name, case in by_name.items()
+                     if case.find("skipped") is not None or case.get("result") == "skipped"}
+          assert all(case.get("status") == "run" and case.get("result") == "completed"
+                     for name, case in by_name.items() if name not in skipped), "Case not executed"
+          if mode == "classic":
+              expected = {
+                  "ReleaseSafeTimeoutRemainsFailedAfterLateCompletion",
+                  "ReleaseSafeDelayedConsumerKeepsCompletedSuccess",
+                  "ReleaseSafeQueryErrorRetainsBusyBatch",
+                  "ReleaseSafeFailedTaskDoesNotReleaseOtherTask",
+                  "ReleaseSafePartialSubmitKeepsBorrowedRequests",
+                  "ReleaseSafeConcurrentWaitersReleaseOnce",
+                  "ReleaseSafeDestructorWaitsForLateCompletion",
+                  "ReleaseSafeSubmitErrorReturnsOwnedFailedFuture",
+                  "ReleaseSafeTcpSubmitOwnsRequestsThroughCompletion",
+              }
+              expected_skips = {"ReleaseSafeRejectsTentBeforeBatchAllocation",
+                                "ReleaseSafeRejectsEventBeforeBatchAllocation"}
+              assert set(by_name) == expected | expected_skips, set(by_name)
+              assert skipped == expected_skips, skipped
+          else:
+              assert set(by_name) == {"ReleaseSafeRejectsEventBeforeBatchAllocation"}, by_name
+              assert not skipped, "Event rejection must execute"
+          print(f"{mode}: {len(cases) - len(skipped)} executed, {len(skipped)} expected variant skips")
+          PY
+            if [[ "$mode" == event ]]; then
+              async_bin="$build_dir/mooncake-transfer-engine/tests/rdma_async_event_drain_test"
+              timeout 180s "$async_bin" "--gtest_output=xml:$EVIDENCE_DIR/event-async.xml" \
+                2>&1 | tee "$EVIDENCE_DIR/event-async.log"
+              te_filter='TransportTest.EventCompletion*:TransportTest.GroupedTaskCompletionWaitsForSubmissionSeal'
+              te_bin="$build_dir/mooncake-transfer-engine/tests/transport_uint_test"
+              "$te_bin" --gtest_list_tests 2>&1 | tee "$EVIDENCE_DIR/event-te-list.log"
+              timeout 180s "$te_bin" "--gtest_filter=$te_filter" \
+                "--gtest_output=xml:$EVIDENCE_DIR/event-te.xml" \
+                2>&1 | tee "$EVIDENCE_DIR/event-te.log"
+              "$JOINT_VENV/bin/python" - "$EVIDENCE_DIR/event-async.xml" "$EVIDENCE_DIR/event-te.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          expected = {
+              "EventCompletionProducerLocksBeforeCounters",
+              "EventCompletionMultiFreeJoinsMutex",
+              "EventCompletionBaseFreeJoinsMutex",
+              "EventCompletionCvRequiresRealBatchQueryBeforeFree",
+              "EventCompletionFailedSliceWithPendingSameTaskStaysBusy",
+              "EventCompletionFailedBatchSummaryNeedsRemainingQuery",
+              "EventCompletionSingleRequestWaitsForSubmissionSeal",
+              "GroupedTaskCompletionWaitsForSubmissionSeal",
+          }
+          async_cases = ET.parse(sys.argv[1]).getroot().findall(".//testcase")
+          te_cases = ET.parse(sys.argv[2]).getroot().findall(".//testcase")
+          assert len(async_cases) == 5, async_cases
+          assert len(te_cases) == 8 and {case.get("name") for case in te_cases} == expected
+          for case in async_cases + te_cases:
+              assert case.get("status") == "run" and case.get("result") == "completed"
+              assert all(case.find(tag) is None for tag in ("failure", "error", "skipped"))
+          print("Candidate async-fd: 5 cases; candidate TE event lifetime: 8 cases; no skips")
+          PY
+            fi
+          done
+          cmake --install "$GITHUB_WORKSPACE/build-classic" --component python \
+            2>&1 | tee "$EVIDENCE_DIR/native-python-install.log"
+          cp "$GITHUB_WORKSPACE/build-classic/install_manifest_python.txt" \
+            "$EVIDENCE_DIR/native-python-install-manifest.txt"
+
+      - name: Record actual native modules and linked libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$JOINT_VENV/bin/python" - "$EVIDENCE_DIR" "$JOINT_VENV" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import subprocess
+          import sys
+          import mooncake.store
+          import mooncake.engine
+
+          root = Path(sys.argv[1])
+          prefix = Path(sys.argv[2]).resolve()
+          modules = {}
+          for module in (mooncake.store, mooncake.engine):
+              path = Path(module.__file__).resolve()
+              assert path.is_relative_to(prefix), path
+              assert path.suffix == ".so", path
+              linked = subprocess.run(["ldd", str(path)], check=True, text=True, capture_output=True)
+              assert "not found" not in linked.stdout, linked.stdout
+              modules[module.__name__] = {
+                  "file": str(path),
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                  "ldd": linked.stdout,
+              }
+          loaded = sorted({
+              line.split()[-1] for line in Path("/proc/self/maps").read_text().splitlines()
+              if "/" in line and ".so" in line.split()[-1]
+          })
+          libraries = {}
+          for filename in loaded:
+              path = Path(filename)
+              if path.is_file():
+                  libraries[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+          (root / "native-loaded-provenance.json").write_text(json.dumps({
+              "modules": modules, "loaded_library_sha256": libraries,
+          }, indent=2, sort_keys=True) + "\n")
+          print(json.dumps(modules, indent=2))
+          PY
+          sha256sum "$GITHUB_WORKSPACE/build-classic/mooncake-store/src/mooncake_master" \
+            > "$EVIDENCE_DIR/master-sha256.txt"
+          ldd "$GITHUB_WORKSPACE/build-classic/mooncake-store/src/mooncake_master" \
+            | tee "$EVIDENCE_DIR/master-ldd.log"
+          ! grep -q 'not found' "$EVIDENCE_DIR/master-ldd.log"
+
+      - name: Run real SGLang to native Mooncake joint CPU entry
+        timeout-minutes: 5
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/sglang-source/python
+          JOINT_SG_SOURCE_SHA: ${{ env.SG_SOURCE_SHA }}
+          JOINT_MC_SOURCE_SHA: ${{ github.sha }}
+          MOONCAKE_JOINT_MASTER_BIN: ${{ github.workspace }}/build-classic/mooncake-store/src/mooncake_master
+          MOONCAKE_JOINT_EVIDENCE: ${{ env.EVIDENCE_DIR }}/joint-entry.json
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=15s 240s "$JOINT_VENV/bin/python" \
+            sglang-source/test/manual/mem_cache/test_mooncake_joint_candidate.py \
+            2>&1 | tee "$EVIDENCE_DIR/joint-entry.log"
+          test -s "$MOONCAKE_JOINT_EVIDENCE"
+          git -C source diff --exit-code
+          git -C sglang-source diff --exit-code
+
+      - name: Preserve bounded diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          python3 - "$EVIDENCE_DIR" <<'PY'
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          truncated = []
+          for path in root.glob("*.log"):
+              if path.stat().st_size > 1024 * 1024:
+                  with path.open("rb") as source:
+                      source.seek(-1024 * 1024, 2)
+                      tail = source.read()
+                  path.write_bytes(b"[TRUNCATED: preserved final 1 MiB]\n" + tail)
+                  truncated.append(path.name)
+          total = sum(path.stat().st_size for path in root.iterdir() if path.is_file())
+          assert total <= 20 * 1024 * 1024, f"Diagnostic payload exceeds limit: {total}"
+          (root / "artifact-scope.txt").write_text(
+              "Logs/XML/JSON/metadata only; no build binaries or model weights.\n"
+              f"Payload bytes: {total}\nTruncated logs: {truncated}\n"
+          )
+          PY
+          {
+            echo "### Joint candidate CPU validation"
+            echo "Mooncake source and workflow SHA: $GITHUB_SHA"
+            echo "Frozen SGLang source SHA: $SG_SOURCE_SHA"
+            echo "Actual store/engine/master build, native regressions, and joint full-page bytes entry."
+            echo "A failed or missing joint entry is not PASS."
+            echo "Selected CPU interface environment; original SGLang dependency declaration unchanged."
+            echo "Default SGLang CUDA/Rust build, Mooncake Rust bindings, GPU/RDMA, device drain and performance remain untested."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload bounded evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cache-joint-cpu-${{ github.run_id }}
+          path: ${{ env.EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 9

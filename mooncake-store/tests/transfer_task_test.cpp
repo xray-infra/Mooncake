@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <future>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -20,9 +21,34 @@
 
 namespace mooncake {
 
-// Test fixture for TransferTask tests
-// TODO: Currently, this test does not cover TransferSubmitter and
-// TransferEngine integration. Will add more tests in the future.
+// Access existing production state without a mock completion implementation.
+class TransferTaskTestPeer {
+   public:
+    static BatchID batch(const TransferEngineOperationState& state) {
+        return state.batch_id_;
+    }
+
+    static const TransferRequest* request(
+        const TransferEngineOperationState& state, size_t index) {
+        return &state.requests_.at(index);
+    }
+
+    static void expire(TransferEngineOperationState& state) {
+        std::lock_guard<std::mutex> lock(state.mutex_);
+        state.start_ts_ = getCurrentTimeInMilli() - 61000;
+    }
+
+    static void fail_submission(TransferEngineOperationState& state) {
+        std::lock_guard<std::mutex> lock(state.mutex_);
+        state.transfer_failed_ = true;
+    }
+
+    static std::optional<TransferFuture> submit(
+        TransferSubmitter& submitter, std::vector<TransferRequest>& requests) {
+        return submitter.submitTransfer(requests);
+    }
+};
+
 class ScopedEnvVar {
    public:
     ScopedEnvVar(const char* name, const char* value) : name_(name) {
@@ -79,6 +105,252 @@ TEST_F(TransferTaskTest, MemcpyOperationState) {
     state->set_completed(ErrorCode::OK);
     EXPECT_TRUE(state->is_completed());
     EXPECT_EQ(state->get_result(), ErrorCode::OK);
+}
+
+#ifndef USE_EVENT_DRIVEN_COMPLETION
+// These tests exercise the actual classic TE status query / Busy / free path.
+// Controlled BatchDesc histories do not prove RNIC or GPU DMA quiescence.
+static std::shared_ptr<TransferEngineOperationState> MakeReleaseSafeState(
+    TransferEngine& engine, size_t request_count, size_t task_count) {
+    std::vector<TransferRequest> requests(request_count);
+    BatchID batch_id = engine.allocateBatchID(request_count);
+    auto state = std::make_shared<TransferEngineOperationState>(
+        engine, batch_id, std::move(requests));
+    auto& batch = Transport::toBatchDesc(batch_id);
+    for (size_t i = 0; i < task_count; ++i) {
+        auto& task = batch.task_list.emplace_back();
+        task.batch_id = batch_id;
+        task.slice_count = 1;
+        task.request = TransferTaskTestPeer::request(*state, i);
+    }
+    return state;
+}
+
+TEST_F(TransferTaskTest, ReleaseSafeTimeoutRemainsFailedAfterLateCompletion) {
+    ScopedEnvVar classic("MC_USE_TENT", nullptr);
+    ScopedEnvVar classic_v1("MC_USE_TEV1", nullptr);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17941"), 0);
+    auto state = MakeReleaseSafeState(engine, 1, 1);
+    const BatchID batch_id = TransferTaskTestPeer::batch(*state);
+    auto& task = Transport::toBatchDesc(batch_id).task_list[0];
+    TransferTaskTestPeer::expire(*state);
+
+    EXPECT_FALSE(state->is_completed());
+    EXPECT_EQ(TransferTaskTestPeer::batch(*state), batch_id);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).IsBatchBusy());
+    __atomic_store_n(&task.success_slice_count, 1, __ATOMIC_RELEASE);
+
+    state->wait_for_completion();
+    EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
+    EXPECT_EQ(TransferTaskTestPeer::batch(*state), INVALID_BATCH_ID);
+    // Repeated completion calls must not query or free the invalidated handle.
+    EXPECT_TRUE(state->is_completed());
+    state->wait_for_completion();
+    EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
+}
+
+TEST_F(TransferTaskTest, ReleaseSafeDelayedConsumerKeepsCompletedSuccess) {
+    ScopedEnvVar classic("MC_USE_TENT", nullptr);
+    ScopedEnvVar classic_v1("MC_USE_TEV1", nullptr);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17951"), 0);
+    auto state = MakeReleaseSafeState(engine, 1, 1);
+    auto& task = Transport::toBatchDesc(TransferTaskTestPeer::batch(*state))
+                     .task_list[0];
+    __atomic_store_n(&task.success_slice_count, 1, __ATOMIC_RELEASE);
+    TransferTaskTestPeer::expire(*state);
+    // A late consumer is not proof that a completed transfer timed out.
+    EXPECT_TRUE(state->is_completed());
+    EXPECT_EQ(state->get_result(), ErrorCode::OK);
+}
+
+TEST_F(TransferTaskTest, ReleaseSafeQueryErrorRetainsBusyBatch) {
+    ScopedEnvVar classic("MC_USE_TENT", nullptr);
+    ScopedEnvVar classic_v1("MC_USE_TEV1", nullptr);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17942"), 0);
+    // The second query reports out-of-range while the first task is in flight.
+    auto state = MakeReleaseSafeState(engine, 2, 1);
+    const BatchID batch_id = TransferTaskTestPeer::batch(*state);
+    auto& task = Transport::toBatchDesc(batch_id).task_list[0];
+    EXPECT_FALSE(state->is_completed());
+    EXPECT_TRUE(engine.freeBatchID(batch_id).IsBatchBusy());
+    __atomic_store_n(&task.success_slice_count, 1, __ATOMIC_RELEASE);
+    state->wait_for_completion();
+    EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
+}
+
+TEST_F(TransferTaskTest, ReleaseSafeFailedTaskDoesNotReleaseOtherTask) {
+    ScopedEnvVar classic("MC_USE_TENT", nullptr);
+    ScopedEnvVar classic_v1("MC_USE_TEV1", nullptr);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17943"), 0);
+    auto state = MakeReleaseSafeState(engine, 2, 2);
+    const BatchID batch_id = TransferTaskTestPeer::batch(*state);
+    auto& tasks = Transport::toBatchDesc(batch_id).task_list;
+    __atomic_store_n(&tasks[0].failed_slice_count, 1, __ATOMIC_RELEASE);
+    EXPECT_FALSE(state->is_completed());
+    EXPECT_TRUE(engine.freeBatchID(batch_id).IsBatchBusy());
+    __atomic_store_n(&tasks[1].success_slice_count, 1, __ATOMIC_RELEASE);
+    state->wait_for_completion();
+    EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
+}
+
+TEST_F(TransferTaskTest, ReleaseSafePartialSubmitKeepsBorrowedRequests) {
+    ScopedEnvVar classic("MC_USE_TENT", nullptr);
+    ScopedEnvVar classic_v1("MC_USE_TEV1", nullptr);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17944"), 0);
+    auto state = MakeReleaseSafeState(engine, 2, 2);
+    const BatchID batch_id = TransferTaskTestPeer::batch(*state);
+    auto& tasks = Transport::toBatchDesc(batch_id).task_list;
+    TransferTaskTestPeer::fail_submission(*state);
+    EXPECT_FALSE(state->is_completed());
+    EXPECT_EQ(tasks[1].request, TransferTaskTestPeer::request(*state, 1));
+    __atomic_store_n(&tasks[0].success_slice_count, 1, __ATOMIC_RELEASE);
+    EXPECT_FALSE(state->is_completed());
+    EXPECT_EQ(tasks[1].request, TransferTaskTestPeer::request(*state, 1));
+    __atomic_store_n(&tasks[1].failed_slice_count, 1, __ATOMIC_RELEASE);
+    state->wait_for_completion();
+    EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
+}
+
+TEST_F(TransferTaskTest, ReleaseSafeConcurrentWaitersReleaseOnce) {
+    ScopedEnvVar classic("MC_USE_TENT", nullptr);
+    ScopedEnvVar classic_v1("MC_USE_TEV1", nullptr);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17945"), 0);
+    auto state = MakeReleaseSafeState(engine, 1, 1);
+    auto& task = Transport::toBatchDesc(TransferTaskTestPeer::batch(*state))
+                     .task_list[0];
+    std::promise<void> started;
+    auto ready = started.get_future();
+    auto waiter = std::async(std::launch::async, [state, &started] {
+        started.set_value();
+        state->wait_for_completion();
+        return state->get_result();
+    });
+    ready.wait();
+    EXPECT_FALSE(state->is_completed());
+    EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(10)),
+              std::future_status::timeout);
+    __atomic_store_n(&task.success_slice_count, 1, __ATOMIC_RELEASE);
+    state->wait_for_completion();
+    EXPECT_EQ(waiter.get(), ErrorCode::OK);
+    EXPECT_TRUE(state->is_completed());
+    EXPECT_EQ(TransferTaskTestPeer::batch(*state), INVALID_BATCH_ID);
+}
+
+TEST_F(TransferTaskTest, ReleaseSafeDestructorWaitsForLateCompletion) {
+    ScopedEnvVar classic("MC_USE_TENT", nullptr);
+    ScopedEnvVar classic_v1("MC_USE_TEV1", nullptr);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17946"), 0);
+    auto state = MakeReleaseSafeState(engine, 1, 1);
+    auto& task = Transport::toBatchDesc(TransferTaskTestPeer::batch(*state))
+                     .task_list[0];
+    std::promise<void> started;
+    auto ready = started.get_future();
+    auto dropped = std::async(std::launch::async,
+                              [owned = std::move(state), &started]() mutable {
+                                  started.set_value();
+                                  owned.reset();
+                              });
+    ready.wait();
+    EXPECT_EQ(dropped.wait_for(std::chrono::milliseconds(10)),
+              std::future_status::timeout);
+    __atomic_store_n(&task.success_slice_count, 1, __ATOMIC_RELEASE);
+    dropped.get();
+}
+
+TEST_F(TransferTaskTest, ReleaseSafeSubmitErrorReturnsOwnedFailedFuture) {
+    ScopedEnvVar classic("MC_USE_TENT", nullptr);
+    ScopedEnvVar classic_v1("MC_USE_TEV1", nullptr);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17947"), 0);
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(engine, backend, engine.getLocalIpAndPort());
+    char payload = 'a';
+    // No transport/segment can serve this request; no task is submitted.
+    std::vector<TransferRequest> requests{
+        {TransferRequest::WRITE, &payload,
+         std::numeric_limits<SegmentID>::max(), 0, 1}};
+    auto future = TransferTaskTestPeer::submit(submitter, requests);
+    ASSERT_TRUE(future);
+    EXPECT_EQ(future->get(), ErrorCode::TRANSFER_FAIL);
+    EXPECT_TRUE(future->isReady());
+}
+
+TEST_F(TransferTaskTest, ReleaseSafeTcpSubmitOwnsRequestsThroughCompletion) {
+    ScopedEnvVar classic("MC_USE_TENT", nullptr);
+    ScopedEnvVar classic_v1("MC_USE_TEV1", nullptr);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17948"), 0);
+    ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+    std::vector<char> source(4096, 's'), destination(source.size(), 0);
+    ASSERT_EQ(engine.registerLocalMemory(source.data(), source.size(), "cpu:0"),
+              0);
+    ASSERT_EQ(engine.registerLocalMemory(destination.data(), destination.size(),
+                                         "cpu:0"),
+              0);
+    const SegmentID segment = engine.openSegment(engine.getLocalIpAndPort());
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(engine, backend, engine.getLocalIpAndPort());
+    std::vector<TransferRequest> requests{
+        {TransferRequest::WRITE, source.data(), segment,
+         reinterpret_cast<uintptr_t>(destination.data()), source.size()}};
+    auto future = TransferTaskTestPeer::submit(submitter, requests);
+    ASSERT_TRUE(future);
+    // The caller's local vector can disappear while the future keeps TE's
+    // borrowed descriptors alive.
+    requests.clear();
+    requests.shrink_to_fit();
+    EXPECT_EQ(future->get(), ErrorCode::OK);
+    EXPECT_EQ(source, destination);
+    EXPECT_EQ(engine.unregisterLocalMemory(source.data()), 0);
+    EXPECT_EQ(engine.unregisterLocalMemory(destination.data()), 0);
+}
+#endif
+
+TEST_F(TransferTaskTest, ReleaseSafeRejectsTentBeforeBatchAllocation) {
+#ifdef USE_TENT
+    ScopedEnvVar tent("MC_USE_TENT", "1");
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17949"), 0);
+    ASSERT_TRUE(engine.isUsingTent());
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(engine, backend, "");
+    // With its backend destroyed, any batch allocation/submission would access
+    // an invalid engine. The gate only reads the cached backend selection.
+    ASSERT_EQ(engine.freeEngine(), 0);
+    std::vector<TransferRequest> requests(1);
+    const auto* original_data = requests.data();
+    EXPECT_FALSE(TransferTaskTestPeer::submit(submitter, requests));
+    EXPECT_EQ(requests.data(), original_data);
+    EXPECT_EQ(requests.size(), 1u);
+#else
+    GTEST_SKIP() << "TENT support is not compiled";
+#endif
+}
+
+TEST_F(TransferTaskTest, ReleaseSafeRejectsEventBeforeBatchAllocation) {
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    ScopedEnvVar classic("MC_USE_TENT", nullptr);
+    ScopedEnvVar classic_v1("MC_USE_TEV1", nullptr);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17950"), 0);
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(engine, backend, "");
+    ASSERT_EQ(engine.freeEngine(), 0);
+    std::vector<TransferRequest> requests(1);
+    const auto* original_data = requests.data();
+    EXPECT_FALSE(TransferTaskTestPeer::submit(submitter, requests));
+    EXPECT_EQ(requests.data(), original_data);
+    EXPECT_EQ(requests.size(), 1u);
+#else
+    GTEST_SKIP() << "Event-driven completion is not compiled";
+#endif
 }
 
 // Test MemcpyWorkerPool basic functionality
