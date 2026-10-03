@@ -56,7 +56,7 @@ jobs:
             df -h .
             git -C source submodule status
             sha256sum source/.github/workflows/cache-native-cpu-validation.yml \
-              source/python/pyproject.toml sglang-source/python/pyproject.toml \
+              source/pyproject.toml sglang-source/python/pyproject.toml \
               sglang-source/test/manual/mem_cache/test_mooncake_joint_candidate.py
             echo "Selected native C++/Python CPU interfaces, not either project's default build."
             echo "Mooncake Rust stays configured ON; selected targets do not build Rust bindings."
