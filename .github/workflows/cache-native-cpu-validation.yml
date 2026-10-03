@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
-      SG_SOURCE_SHA: b5b565a818f87f988904a4218cb603acb89b104c
+      SG_SOURCE_SHA: c84c5091040cc30502f366c2c449e3707fbe2931
       EVIDENCE_DIR: ${{ github.workspace }}/evidence
       JOINT_VENV: ${{ github.workspace }}/joint-venv
       HF_HUB_OFFLINE: "1"
@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: xray-infra/sglang
-          ref: b5b565a818f87f988904a4218cb603acb89b104c
+          ref: c84c5091040cc30502f366c2c449e3707fbe2931
           path: sglang-source
           persist-credentials: false
 
